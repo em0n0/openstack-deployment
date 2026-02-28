@@ -483,32 +483,90 @@ run_setup_wizard() {
     fi
 
     # ── Write to main.env ─────────────────────────────────────────────────────
+    # Python handles the file rewrite so passwords with special chars (* / & @ etc.)
+    # never break sed's s|...|...| syntax.
     if [[ "${DRY_RUN}" == "true" ]]; then
         echo -e "  ${DIM}[DRY-RUN] Would write all settings to ${CONFIG}${NC}"
     else
-        sed -i "s|^HOST_IP=.*|HOST_IP=\"${new_ip}\"|"                                     "${CONFIG}"
-        sed -i "s|^INTERFACE_NAME=.*|INTERFACE_NAME=\"${new_iface}\"|"                    "${CONFIG}"
-        sed -i "s|^CONTROLLER_IFACE=.*|CONTROLLER_IFACE=\"${new_iface}\"|"                "${CONFIG}"
-        sed -i "s|^DEPLOY_MODE=.*|DEPLOY_MODE=\"${new_mode}\"|"                            "${CONFIG}"
-        sed -i "s|^ADMIN_PASS=.*|ADMIN_PASS=\"${new_admin_pass}\"|"                        "${CONFIG}"
-        sed -i "s|^DB_PASS=.*|DB_PASS=\"${new_db_pass}\"|"                                 "${CONFIG}"
-        sed -i "s|^KEYSTONE_SERVICES_STR=.*|KEYSTONE_SERVICES_STR=\"${ks_enabled_str}\"|"  "${CONFIG}"
-
-        [[ "${new_mode}" == "all-in-one" ]] && \
-            sed -i "s|^CONTROLLER_IP=.*|CONTROLLER_IP=\"${new_ip}\"|" "${CONFIG}"
-
+        # Serialise the INSTALL_ selections as KEY=val pairs (comma-separated)
+        local install_map=""
         for i in "${!svc_keys[@]}"; do
-            local key="${svc_keys[$i]}"
-            local val="${svc_state[$i]}"
-            sed -i "s|^INSTALL_${key}=.*|INSTALL_${key}=\"${val}\"|" "${CONFIG}"
+            install_map+="${svc_keys[$i]}=${svc_state[$i]},"
         done
 
-        # Sync DISTRO_FAMILY so subscripts know what distro they're on
-        if grep -q "^DISTRO_FAMILY=" "${CONFIG}"; then
-            sed -i "s|^DISTRO_FAMILY=.*|DISTRO_FAMILY=\"${DISTRO_FAMILY}\"|" "${CONFIG}"
-        else
-            echo "DISTRO_FAMILY=\"${DISTRO_FAMILY}\"" >> "${CONFIG}"
-        fi
+        python3 - \
+            "${CONFIG}" \
+            "${new_ip}" \
+            "${new_iface}" \
+            "${new_mode}" \
+            "${new_admin_pass}" \
+            "${new_db_pass}" \
+            "${ks_enabled_str}" \
+            "${DISTRO_FAMILY:-debian}" \
+            "${install_map}" \
+            << 'PYEOF'
+import sys, re
+
+cfg_path    = sys.argv[1]
+new_ip      = sys.argv[2]
+new_iface   = sys.argv[3]
+new_mode    = sys.argv[4]
+admin_pass  = sys.argv[5]
+db_pass     = sys.argv[6]
+ks_str      = sys.argv[7]
+distro_fam  = sys.argv[8]
+install_raw = sys.argv[9]
+
+# Parse comma-separated KEY=val pairs
+install_map = {}
+for entry in install_raw.rstrip(",").split(","):
+    if "=" in entry:
+        k, v = entry.split("=", 1)
+        install_map[k.strip()] = v.strip()
+
+# Map of config key -> new value (values treated as plain strings, not regex)
+replacements = {
+    "HOST_IP":               new_ip,
+    "INTERFACE_NAME":        new_iface,
+    "CONTROLLER_IFACE":      new_iface,
+    "DEPLOY_MODE":           new_mode,
+    "ADMIN_PASS":            admin_pass,
+    "DB_PASS":               db_pass,
+    "SERVICE_PASS":          db_pass,
+    "RABBIT_PASS":           db_pass,
+    "KEYSTONE_SERVICES_STR": ks_str,
+    "DISTRO_FAMILY":         distro_fam,
+}
+if new_mode == "all-in-one":
+    replacements["CONTROLLER_IP"] = new_ip
+
+for k, v in install_map.items():
+    replacements[f"INSTALL_{k}"] = v
+
+with open(cfg_path, "r") as f:
+    lines = f.readlines()
+
+seen = set()
+new_lines = []
+for line in lines:
+    matched = False
+    for key, val in replacements.items():
+        if re.match(rf'^{re.escape(key)}=', line):
+            new_lines.append(f'{key}="{val}"\n')
+            seen.add(key)
+            matched = True
+            break
+    if not matched:
+        new_lines.append(line)
+
+# Append keys not found in existing file
+for key, val in replacements.items():
+    if key not in seen:
+        new_lines.append(f'{key}="{val}"\n')
+
+with open(cfg_path, "w") as f:
+    f.writelines(new_lines)
+PYEOF
 
         source "${CONFIG}"
         ok "Settings saved to ${CONFIG}"
@@ -714,7 +772,9 @@ run_full_deployment() {
     [[ "${INSTALL_DESIGNATE}"  == "true" ]] && echo "    + Designate (DNS)"
     echo ""
 
-    [[ "${DRY_RUN}" != "true" ]] && { require_root; require_debian_based; require_internet; }
+if [[ "${DRY_RUN}" != "true" ]]; then
+        require_root; require_debian_based; require_internet
+    fi
 
     if [[ "${DRY_RUN}" != "true" ]]; then
         echo -ne "  ${BOLD}Proceed? This takes 20-40 minutes. (y/N):${NC} "
@@ -775,7 +835,7 @@ _run_base_steps() {
 run_base_openstack() {
     validate_config
     section "Base OpenStack Deployment"
-    [[ "${DRY_RUN}" != "true" ]] && require_root
+    if [[ "${DRY_RUN}" != "true" ]]; then require_root; fi
     [[ "${RESUME_MODE}" != "true" ]] && clear_checkpoints
     _run_base_steps
 }
@@ -1271,7 +1331,9 @@ press_enter() {
 # =============================================================================
 
 # --help can run without root
-[[ "${1:-}" == "--help" || "${1:-}" == "-h" ]] && { show_help; exit 0; }
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    show_help; exit 0
+fi
 
 require_root
 
