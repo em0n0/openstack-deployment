@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#   OpenStack Complete — Master Deployment Script  (v4)
+#   OpenStack Complete — Master Deployment Script  (v4.1)
 #   Debian-based distros | OpenStack 2024.1 Caracal
 #
 #   USAGE:  sudo bash deploy.sh [FLAG]
@@ -21,6 +21,8 @@
 #     --ssl         SSL certificate management
 #     --verify      Health check all services
 #     --config      Show current config
+#     --quick       Wizard: accept auto-detected values, just set passwords
+#     --rollback-step KEY  Roll back a single failed step (e.g. --rollback-step nova)
 #     --dry-run     Preview all actions without executing
 #     --help        Show this message
 # =============================================================================
@@ -37,11 +39,21 @@ LOG_FILE="${LOG_DIR}/deploy_${TIMESTAMP}.log"
 # ─── PARSE FLAGS BEFORE SOURCING ──────────────────────────────────────────────
 DRY_RUN=false
 RESUME_MODE=false
+QUICK_WIZARD=false
+ROLLBACK_STEP_KEY=""
 for arg in "$@"; do
     if [[ "${arg}" == "--dry-run" ]]; then DRY_RUN=true; fi
     if [[ "${arg}" == "--resume"  ]]; then RESUME_MODE=true; fi
+    if [[ "${arg}" == "--quick"   ]]; then QUICK_WIZARD=true; fi
 done
-export DRY_RUN
+# --rollback-step KEY: capture the key from the next argument
+for i in "${!@}"; do
+    if [[ "${!i:-}" == "--rollback-step" ]]; then
+        next=$(( i + 1 ))
+        ROLLBACK_STEP_KEY="${!next:-}"
+    fi
+done 2>/dev/null || true
+export DRY_RUN QUICK_WIZARD
 
 # ─── BOOTSTRAP ────────────────────────────────────────────────────────────────
 if [[ ! -f "${CONFIG}" ]]; then
@@ -71,6 +83,11 @@ DIM='\033[2m'
 # ─── CHECKPOINT FILE ──────────────────────────────────────────────────────────
 CHECKPOINT_FILE="${LOG_DIR}/.deployment_checkpoint"
 export CHECKPOINT_FILE
+
+# ─── STEP PROGRESS COUNTERS ───────────────────────────────────────────────────
+# Managed by run_step(). Shows [N/TOTAL] progress on each step banner.
+DEPLOY_STEP_NUM=0
+DEPLOY_TOTAL_STEPS=8   # updated by _run_base_steps / _run_service_steps
 
 # =============================================================================
 # BANNER
@@ -164,6 +181,9 @@ run_setup_wizard() {
     echo -e "  ${BOLD}${CYAN}Setup Wizard${NC}  — configure your deployment."
     echo -e "  ${DIM}Detected: ${DISTRO_ID} ${DISTRO_VERSION} (${DISTRO_CODENAME}) on ${HARDWARE_TYPE} hardware.${NC}"
     echo -e "  ${DIM}Answers are written to configs/main.env via Python (safe for all passwords).${NC}"
+    if [[ "${QUICK_WIZARD}" == "true" || "${QUICK_SETUP:-false}" == "true" ]]; then
+        echo -e "  ${GREEN}Quick mode:${NC} auto-detected IP and interface accepted. Only passwords required."
+    fi
     echo ""
 
     # ── Step 1: Host IP ──────────────────────────────────────────────────────
@@ -197,7 +217,18 @@ run_setup_wizard() {
 
     local new_ip=""
     local ip_error=""
-    while true; do
+
+    # Quick mode: accept auto-detected IP without prompting
+    if [[ "${QUICK_WIZARD}" == "true" || "${QUICK_SETUP:-false}" == "true" ]]; then
+        if [[ "${HOST_IP}" != "__CHANGE_ME__" ]] && validate_ip "${HOST_IP}"; then
+            new_ip="${HOST_IP}"
+            ok "Quick mode: IP accepted as ${new_ip}"
+        else
+            echo -e "  ${YELLOW}Quick mode: IP not auto-detected. Please enter it manually.${NC}"
+        fi
+    fi
+
+    while [[ -z "${new_ip}" ]]; do
         if [[ -n "${ip_error}" ]]; then
             echo -e "  ${RED}  ✖ ${ip_error}${NC}"
             ip_error=""
@@ -767,7 +798,6 @@ run_module() {
     local title="$1"; local script="$2"; shift 2
     local args=("$@")
 
-    section "${title}"
     log "Script: ${script} ${args[*]:-}"
     log "Log:    ${LOG_FILE}"
     start_timer
@@ -779,23 +809,66 @@ run_module() {
     fi
 
     if bash "${script}" "${args[@]:-}" 2>&1 | tee -a "${LOG_FILE}"; then
-        ok "${title} completed in $(elapsed)"
+        ok "${title} completed in $(elapsed_human)"
     else
-        error "${title} FAILED after $(elapsed). See: ${LOG_FILE}"
+        # Capture exit code before calling step_failed (which returns 0)
+        step_failed "${title}" "${title}" "${LOG_FILE}" 30
+        return 1
     fi
 }
 
-# Checkpoint-aware step runner
+# Checkpoint-aware step runner with progress display and rollback registration
 run_step() {
     local key="$1"; local title="$2"; local script="$3"; shift 3
 
     if step_ran "${key}"; then
         echo -e "  ${DIM}⏭  Skipping '${title}' (already completed).${NC}"
+        DEPLOY_STEP_NUM=$(( DEPLOY_STEP_NUM + 1 ))
         return 0
     fi
 
+    DEPLOY_STEP_NUM=$(( DEPLOY_STEP_NUM + 1 ))
+    progress_step "${DEPLOY_STEP_NUM}" "${DEPLOY_TOTAL_STEPS}" "${title}"
+
+    # Register rollback before running — so if it fails we can clean up
+    _register_step_rollback "${key}"
+
     run_module "${title}" "${script}" "$@"
     step_done "${key}"
+}
+
+# Built-in rollback commands for each known step.
+# These are conservative: they remove what a step installs without touching
+# anything that was already there before the step ran.
+_register_step_rollback() {
+    local key="$1"
+    case "${key}" in
+        prerequisites)
+            register_rollback "${key}"                 "apt-get purge -y mariadb-server rabbitmq-server memcached etcd 2>/dev/null || true; apt-get autoremove -y 2>/dev/null || true"
+            ;;
+        keystone)
+            register_rollback "${key}"                 "apt-get purge -y keystone 2>/dev/null || true; rm -rf /etc/keystone /var/lib/keystone /var/log/keystone; mysql --defaults-extra-file=<(printf '[client]\npassword=%s\n' "\${DB_PASS}") -u root -e 'DROP DATABASE IF EXISTS keystone;' 2>/dev/null || true"
+            ;;
+        glance)
+            register_rollback "${key}"                 "apt-get purge -y glance 2>/dev/null || true; rm -rf /etc/glance /var/lib/glance /var/log/glance; mysql --defaults-extra-file=<(printf '[client]\npassword=%s\n' "\${DB_PASS}") -u root -e 'DROP DATABASE IF EXISTS glance;' 2>/dev/null || true"
+            ;;
+        placement)
+            register_rollback "${key}"                 "apt-get purge -y placement-api 2>/dev/null || true; rm -rf /etc/placement /var/lib/placement; mysql --defaults-extra-file=<(printf '[client]\npassword=%s\n' "\${DB_PASS}") -u root -e 'DROP DATABASE IF EXISTS placement;' 2>/dev/null || true"
+            ;;
+        nova)
+            register_rollback "${key}"                 "apt-get purge -y nova-api nova-conductor nova-scheduler nova-compute nova-novncproxy 2>/dev/null || true; rm -rf /etc/nova /var/lib/nova /var/log/nova; mysql --defaults-extra-file=<(printf '[client]\npassword=%s\n' "\${DB_PASS}") -u root -e 'DROP DATABASE IF EXISTS nova; DROP DATABASE IF EXISTS nova_api; DROP DATABASE IF EXISTS nova_cell0;' 2>/dev/null || true"
+            ;;
+        neutron)
+            register_rollback "${key}"                 "apt-get purge -y neutron-server neutron-linuxbridge-agent neutron-dhcp-agent neutron-metadata-agent 2>/dev/null || true; rm -rf /etc/neutron /var/lib/neutron /var/log/neutron; mysql --defaults-extra-file=<(printf '[client]\npassword=%s\n' "\${DB_PASS}") -u root -e 'DROP DATABASE IF EXISTS neutron;' 2>/dev/null || true"
+            ;;
+        horizon)
+            register_rollback "${key}"                 "apt-get purge -y openstack-dashboard 2>/dev/null || true; rm -rf /etc/openstack-dashboard; systemctl reload apache2 2>/dev/null || true"
+            ;;
+        *)
+            # Generic: remove any packages installed in the step (best-effort)
+            register_rollback "${key}" "echo 'No specific rollback defined for step: ${key}'"
+            ;;
+    esac
 }
 
 # =============================================================================
@@ -822,6 +895,8 @@ run_full_deployment() {
         require_root
         require_debian_based
         require_internet
+        require_disk_space 20
+        require_ram 8
     fi
 
     if [[ "${DRY_RUN}" != "true" ]]; then
@@ -849,24 +924,42 @@ run_full_deployment() {
     local total=$(( $(date +%s) - deploy_start ))
     prune_old_logs
 
+    # Run health check before the success banner
+    health_check_table
+
     section "🎉 Full Deployment Complete"
     echo -e "${GREEN}${BOLD}"
     echo "  ✔ OpenStack is ready!"
     echo ""
-    echo "  Dashboard   :  http://${HOST_IP}/horizon"
-    echo "  Username    :  admin"
-    echo "  Password    :  (your ADMIN_PASS)"
+    echo -e "${NC}  ${BOLD}Access your cloud:${NC}"
     echo ""
-    echo "  CLI access  :  source configs/admin-openrc.sh"
-    printf "  Total time  :  %dm %ds\n" $(( total/60 )) $(( total%60 ))
-    echo "  Full log    :  ${LOG_FILE}"
-    echo -e "${NC}"
+    echo -e "   ${CYAN}Dashboard${NC}    http://${HOST_IP}/horizon"
+    echo -e "   ${CYAN}Username${NC}     admin"
+    echo -e "   ${CYAN}Password${NC}     (your ADMIN_PASS from configs/main.env)"
+    echo ""
+    echo -e "   ${CYAN}CLI access${NC}   source configs/main.env"
+    echo -e "                then: openstack server list"
+    echo ""
+    echo -e "   ${CYAN}Total time${NC}   $(printf "%dm %ds" $(( total/60 )) $(( total%60 )))"
+    echo -e "   ${CYAN}Full log${NC}     ${LOG_FILE}"
+    echo ""
+    echo -e "   ${DIM}Re-run health check any time:  sudo bash deploy.sh --verify${NC}"
+    echo ""
 
     press_enter
     show_menu
 }
 
 _run_base_steps() {
+    # Count enabled extra services to set accurate total
+    local extras=0
+    for flag in INSTALL_CINDER INSTALL_SWIFT INSTALL_HEAT INSTALL_CEILOMETER                 INSTALL_BARBICAN INSTALL_OCTAVIA INSTALL_MANILA INSTALL_DESIGNATE; do
+        if [[ "${!flag:-false}" == "true" ]]; then
+            extras=$(( extras + 1 ))
+        fi
+    done
+    DEPLOY_TOTAL_STEPS=$(( 8 + extras ))
+
     local base="${PROJ}/scripts/base"
     run_step "prerequisites" "System Prerequisites"  "${base}/01_prerequisites.sh"
     run_step "keystone"      "Keystone (Identity)"   "${base}/02_keystone.sh"
@@ -1353,6 +1446,52 @@ prune_old_logs() {
 }
 
 # =============================================================================
+# ROLLBACK SINGLE STEP
+# =============================================================================
+run_rollback_step_cmd() {
+    local key="${1:-}"
+    show_banner
+    if [[ -z "${key}" ]]; then
+        echo -e "  ${YELLOW}Usage:${NC} sudo bash deploy.sh --rollback-step KEY"
+        echo ""
+        echo -e "  ${BOLD}Available step keys:${NC}"
+        echo -e "   prerequisites  keystone  glance  placement"
+        echo -e "   nova  neutron  horizon  verify_base"
+        echo -e "   cinder  swift  heat  ceilometer  barbican  octavia  manila  designate"
+        echo ""
+        echo -e "  ${DIM}This removes what a single step installed and clears its checkpoint,${NC}"
+        echo -e "  ${DIM}so you can re-run --resume after fixing the underlying issue.${NC}"
+        press_enter
+        show_menu
+        return
+    fi
+
+    echo -e "  ${YELLOW}${BOLD}Rollback: ${key}${NC}"
+    echo ""
+    echo -e "  This will:"
+    echo -e "   • Run the rollback command for step '${key}'"
+    echo -e "   • Remove '${key}' from the checkpoint file"
+    echo -e "   • Let you re-run this step with:  sudo bash deploy.sh --resume"
+    echo ""
+    echo -ne "  ${BOLD}Proceed? (y/N):${NC} "
+    read -r confirm
+    if [[ ! "${confirm}" =~ ^[Yy]$ ]]; then
+        show_menu
+        return
+    fi
+
+    # Register and immediately execute the rollback for this step
+    _register_step_rollback "${key}"
+    rollback_step "${key}"
+
+    echo ""
+    echo -e "  ${GREEN}Rollback complete.${NC}"
+    echo -e "  Fix the issue, then resume with:  ${CYAN}sudo bash deploy.sh --resume${NC}"
+    press_enter
+    show_menu
+}
+
+# =============================================================================
 # ENTRY POINT
 # =============================================================================
 
@@ -1375,21 +1514,23 @@ if [[ "${HOST_IP}" == "__CHANGE_ME__" ]] && \
 fi
 
 case "${1:-}" in
-    --wizard)    run_setup_wizard ;;
-    --menu)      show_menu ;;
-    --full)      run_full_deployment ;;
-    --base)      run_base_openstack ;;
-    --services)  run_extra_services ;;
-    --resume)    RESUME_MODE=true; run_resume ;;
-    --multinode) run_multinode_setup ;;
-    --k8s)       run_kubernetes ;;
-    --monitor)   run_health_dashboard ;;
-    --backup)    run_backup ;;
-    --restore)   run_restore ;;
-    --harden)    run_hardening ;;
-    --ssl)       run_ssl ;;
-    --verify)    run_verify ;;
-    --config)    show_config ;;
-    --dry-run)   show_menu ;;
-    *)           show_menu ;;
+    --wizard)        run_setup_wizard ;;
+    --quick)         QUICK_WIZARD=true; run_setup_wizard ;;
+    --menu)          show_menu ;;
+    --full)          run_full_deployment ;;
+    --base)          run_base_openstack ;;
+    --services)      run_extra_services ;;
+    --resume)        RESUME_MODE=true; run_resume ;;
+    --rollback-step) run_rollback_step_cmd "${2:-}" ;;
+    --multinode)     run_multinode_setup ;;
+    --k8s)           run_kubernetes ;;
+    --monitor)       run_health_dashboard ;;
+    --backup)        run_backup ;;
+    --restore)       run_restore ;;
+    --harden)        run_hardening ;;
+    --ssl)           run_ssl ;;
+    --verify)        run_verify ;;
+    --config)        show_config ;;
+    --dry-run)       show_menu ;;
+    *)               show_menu ;;
 esac
