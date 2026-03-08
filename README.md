@@ -141,7 +141,7 @@ The wizard writes all values automatically. These are the most important setting
 ```bash
 # ── Deployment topology ────────────────────────────────────────────────────
 DEPLOY_MODE="all-in-one"        # or "multi-node"
-HOST_IP="192.168.1.27"          # auto-detected; wizard confirms
+HOST_IP="0.0.0.0"          # auto-detected; wizard confirms
 
 # ── Optional services (set "true" to install) ─────────────────────────────
 INSTALL_CINDER="false"          # Block storage    ~200 MB RAM
