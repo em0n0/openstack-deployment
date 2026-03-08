@@ -1,9 +1,9 @@
 **OpenStack Complete** automates the full lifecycle of a self-hosted OpenStack cloud:
 
-- **Deploy** — interactive wizard + single command installs the entire stack
-- **Operate** — health dashboard, backup/restore, SSL, Kubernetes on top
-- **Harden** — CIS Benchmark audit with scored report and auto-fix
-- **Remove** — safe uninstaller with multiple confirmation interlocks
+- **Deploy** - interactive wizard + single command installs the entire stack
+- **Operate** - health dashboard, backup/restore, SSL, Kubernetes on top
+- **Harden** - CIS Benchmark audit with scored report and auto-fix
+- **Remove** - safe uninstaller with multiple confirmation interlocks
 
 Everything is driven by a single configuration file (`configs/main.env`) that the wizard fills in automatically. You never need to touch any of the numbered install scripts.
 
